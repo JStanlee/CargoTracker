@@ -39,6 +39,7 @@
   .leg-title { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em; }
   .leg-title.load { color: var(--load-color); }
   .leg-title.unload { color: var(--unload-color); }
+  .geo-preview { font-size: 0.75rem; color: var(--text-dim); margin-top: 6px; min-height: 14px; }
   button { cursor: pointer; border: none; border-radius: 8px; font-size: 0.9rem; padding: 9px 14px; }
   .btn-primary { background: var(--accent); color: white; width: 100%; margin-top: 16px; font-weight: 600; }
   .btn-primary:disabled { opacity: 0.6; cursor: default; }
@@ -87,9 +88,10 @@
       <div class="leg">
         <div class="leg-title load">Załadunek</div>
         <label>Kod pocztowy</label>
-        <input id="f-kod-z" placeholder="np. 00-950" autocomplete="off">
+        <input id="f-kod-z" placeholder="np. 44000" autocomplete="off">
         <label>Kraj (skrót)</label>
         <input id="f-kraj-z" class="country" list="country-codes" maxlength="2" placeholder="PL">
+        <div class="geo-preview" id="preview-z"></div>
       </div>
 
       <div class="leg">
@@ -98,6 +100,7 @@
         <input id="f-kod-r" placeholder="np. 50670" autocomplete="off">
         <label>Kraj (skrót)</label>
         <input id="f-kraj-r" class="country" list="country-codes" maxlength="2" placeholder="DE">
+        <div class="geo-preview" id="preview-r"></div>
       </div>
       <datalist id="country-codes"></datalist>
 
@@ -134,7 +137,7 @@
         <span><i style="background:var(--unload-color)"></i>Rozładunek</span>
         <span>➤ kierunek jazdy</span>
       </div>
-      <div class="hint">Mapa OpenStreetMap — możesz przybliżać i przesuwać. Nad zieloną kropką widoczna jest data załadunku, nad czerwoną data rozładunku. Kliknij punkt lub trasę, aby przejść do wpisu na liście. Dla PL/DE/CZ/NL/BE/IT pozycja jest liczona z regionu kodu pocztowego; dla pozostałych krajów pokazywane jest przybliżone centrum kraju.</div>
+      <div class="hint">Mapa OpenStreetMap — możesz przybliżać i przesuwać. Pozycje liczone są z realnego kodu pocztowego (miasto), nie tylko z kraju. Nad zieloną kropką widoczna jest data załadunku, nad czerwoną data rozładunku — kliknij punkt, żeby zobaczyć nazwę miasta, albo trasę, żeby przejść do wpisu na liście.</div>
     </div>
 
     <div class="panel table-wrap" style="margin-top:20px;">
@@ -205,6 +208,7 @@ function toCode(raw) {
   return mapped || upper.slice(0, 2);
 }
 
+// Fallback only — used when real geocoding fails or hasn't run yet.
 function estimateCoords(code, postal) {
   const c = toCode(code);
   const table = REGION_DIGITS[c];
@@ -215,6 +219,53 @@ function estimateCoords(code, postal) {
   }
   if (COUNTRY_CODES[c]) return [COUNTRY_CODES[c][1], COUNTRY_CODES[c][2]];
   return null;
+}
+
+// Real postal-code -> city/GPS lookup via the free, keyless zippopotam.us API.
+const GEOCODE_CACHE_KEY = 'geocode_cache_v1';
+let geocodeCache = {};
+try { geocodeCache = JSON.parse(localStorage.getItem(GEOCODE_CACHE_KEY) || '{}'); } catch (e) { geocodeCache = {}; }
+
+async function geocodePostal(countryCode, postal) {
+  const cc = toCode(countryCode);
+  const pc = (postal || '').trim();
+  if (!cc || !pc) return null;
+  const cacheKey = cc + '|' + pc.replace(/\s+/g, '').toUpperCase();
+  if (geocodeCache[cacheKey]) return geocodeCache[cacheKey];
+  try {
+    const resp = await fetch(`https://api.zippopotam.us/${cc.toLowerCase()}/${encodeURIComponent(pc)}`);
+    if (!resp.ok) throw new Error('not found');
+    const data = await resp.json();
+    const place = data.places && data.places[0];
+    if (!place) throw new Error('no place data');
+    const result = {
+      lat: parseFloat(place.latitude),
+      lon: parseFloat(place.longitude),
+      city: place['place name'] || data['place name'] || ''
+    };
+    geocodeCache[cacheKey] = result;
+    try { localStorage.setItem(GEOCODE_CACHE_KEY, JSON.stringify(geocodeCache)); } catch (e) {}
+    return result;
+  } catch (e) {
+    return null;
+  }
+}
+
+async function updateLegPreview(prefix) {
+  const kodEl = document.getElementById(`f-kod-${prefix}`);
+  const krajEl = document.getElementById(`f-kraj-${prefix}`);
+  const previewEl = document.getElementById(`preview-${prefix}`);
+  const kod = kodEl.value.trim();
+  const kraj = toCode(krajEl.value);
+  if (!kod || !kraj) { previewEl.textContent = ''; return; }
+  if (!COUNTRY_CODES[kraj]) { previewEl.textContent = '⚠ nierozpoznany kraj'; return; }
+  previewEl.textContent = '🔍 szukam...';
+  const result = await geocodePostal(kraj, kod);
+  if (result && result.city) {
+    previewEl.textContent = `📍 ${result.city}, ${COUNTRY_CODES[kraj][0]}`;
+  } else {
+    previewEl.textContent = '⚠ nie znaleziono dokładnego miasta — na mapie użyty zostanie region/kraj';
+  }
 }
 
 const countryList = document.getElementById('country-codes');
@@ -231,6 +282,9 @@ Object.entries(COUNTRY_CODES).sort((a,b) => a[0].localeCompare(b[0])).forEach(([
 });
 document.getElementById('f-kraj-z').value = 'PL';
 document.getElementById('f-kraj-r').value = 'DE';
+
+['f-kod-z', 'f-kraj-z'].forEach(id => document.getElementById(id).addEventListener('blur', () => updateLegPreview('z')));
+['f-kod-r', 'f-kraj-r'].forEach(id => document.getElementById(id).addEventListener('blur', () => updateLegPreview('r')));
 
 function loadShipments() {
   try {
@@ -280,8 +334,8 @@ function renderMap() {
   mapLayer.clearLayers();
 
   shipments.forEach(s => {
-    const loadC = estimateCoords(s.krajZ, s.kodZ);
-    const unloadC = estimateCoords(s.krajR, s.kodR);
+    const loadC = (s.loadLat != null && s.loadLon != null) ? [s.loadLat, s.loadLon] : estimateCoords(s.krajZ, s.kodZ);
+    const unloadC = (s.unloadLat != null && s.unloadLon != null) ? [s.unloadLat, s.unloadLon] : estimateCoords(s.krajR, s.kodR);
     if (!loadC || !unloadC) return;
 
     const routeColor = getCssVar('--route-line') || '#475569';
@@ -308,11 +362,13 @@ function renderMap() {
 
     L.marker(loadC, { icon: loadIcon })
       .bindTooltip(fmtDate(s.dataOd) || '—', { permanent: true, direction: 'top', offset: [0, -6], className: 'date-label date-label-load' })
+      .bindPopup(`<b>Załadunek</b><br>${escapeHtml(s.loadCity || s.krajZ)}${s.loadCity ? ', ' + escapeHtml(s.krajZ) : ''}<br>${escapeHtml(s.kodZ)}`)
       .on('click', () => focusRow(s.id))
       .addTo(mapLayer);
 
     L.marker(unloadC, { icon: unloadIcon })
       .bindTooltip(fmtDate(s.dataDo) || '—', { permanent: true, direction: 'top', offset: [0, -6], className: 'date-label date-label-unload' })
+      .bindPopup(`<b>Rozładunek</b><br>${escapeHtml(s.unloadCity || s.krajR)}${s.unloadCity ? ', ' + escapeHtml(s.krajR) : ''}<br>${escapeHtml(s.kodR)}`)
       .on('click', () => focusRow(s.id))
       .addTo(mapLayer);
   });
@@ -347,8 +403,8 @@ function renderTable() {
   emptyMsg.style.display = 'none';
   tbody.innerHTML = list.map(s => `
     <tr id="row-${s.id}">
-      <td>${escapeHtml(s.kodZ)} · ${escapeHtml(s.krajZ)}</td>
-      <td>${escapeHtml(s.kodR)} · ${escapeHtml(s.krajR)}</td>
+      <td>${escapeHtml(s.kodZ)} · ${escapeHtml(s.krajZ)}${s.loadCity ? ' ('+escapeHtml(s.loadCity)+')' : ''}</td>
+      <td>${escapeHtml(s.kodR)} · ${escapeHtml(s.krajR)}${s.unloadCity ? ' ('+escapeHtml(s.unloadCity)+')' : ''}</td>
       <td>${escapeHtml(s.przewoznik)}</td>
       <td>${fmtDate(s.dataOd)}</td>
       <td>${fmtDate(s.dataDo)}</td>
@@ -385,7 +441,7 @@ function setStatus(msg, isError) {
   if (msg) setTimeout(() => { if (el.textContent === msg) el.textContent = ''; }, 4000);
 }
 
-function saveEntry() {
+async function saveEntry() {
   const kodZ = document.getElementById('f-kod-z').value.trim();
   const krajZ = toCode(document.getElementById('f-kraj-z').value);
   const kodR = document.getElementById('f-kod-r').value.trim();
@@ -406,19 +462,42 @@ function saveEntry() {
     return;
   }
 
+  const btn = document.getElementById('btn-save');
+  btn.disabled = true;
+  setStatus('Wyszukiwanie lokalizacji...');
+
+  const [loadGeo, unloadGeo] = await Promise.all([
+    geocodePostal(krajZ, kodZ),
+    geocodePostal(krajR, kodR)
+  ]);
+  const loadFallback = loadGeo ? null : estimateCoords(krajZ, kodZ);
+  const unloadFallback = unloadGeo ? null : estimateCoords(krajR, kodR);
+
   const entry = {
     id: 's' + Date.now() + Math.floor(Math.random()*1000),
     kodZ, krajZ, kodR, krajR, przewoznik, dataOd, dataDo, email, rejestracja, osoba,
-    createdAt: Date.now()
+    createdAt: Date.now(),
+    loadLat: loadGeo ? loadGeo.lat : (loadFallback ? loadFallback[0] : null),
+    loadLon: loadGeo ? loadGeo.lon : (loadFallback ? loadFallback[1] : null),
+    loadCity: loadGeo ? loadGeo.city : '',
+    unloadLat: unloadGeo ? unloadGeo.lat : (unloadFallback ? unloadFallback[0] : null),
+    unloadLon: unloadGeo ? unloadGeo.lon : (unloadFallback ? unloadFallback[1] : null),
+    unloadCity: unloadGeo ? unloadGeo.city : ''
   };
   shipments.push(entry);
   persistShipments();
   renderMap(); renderTable(); refreshCarrierList();
-  setStatus('Zapisano transport.');
+
+  const loadLabel = loadGeo ? loadGeo.city : 'przybliżona lokalizacja (region/kraj)';
+  const unloadLabel = unloadGeo ? unloadGeo.city : 'przybliżona lokalizacja (region/kraj)';
+  setStatus(`Zapisano: ${loadLabel} → ${unloadLabel}`);
 
   ['f-kod-z','f-kod-r','f-data-od','f-data-do','f-email','f-rej'].forEach(id => {
     document.getElementById(id).value = '';
   });
+  document.getElementById('preview-z').textContent = '';
+  document.getElementById('preview-r').textContent = '';
+  btn.disabled = false;
   document.getElementById('f-kod-z').focus();
 }
 
