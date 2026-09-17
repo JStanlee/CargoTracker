@@ -4,12 +4,14 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Tracker Transportów Europa</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <style>
   :root {
     --bg: #f5f6f8; --panel: #ffffff; --border: #e2e5ea; --text: #1c1f26; --text-dim: #6b7280;
     --accent: #2563eb; --accent-dim: #dbeafe; --danger: #dc2626;
     --load-color: #16a34a; --unload-color: #dc2626;
-    --map-water: #eaf2fb; --route-line: #94a3b8;
+    --route-line: #475569;
     --shadow: 0 1px 3px rgba(0,0,0,0.08);
   }
   @media (prefers-color-scheme: dark) {
@@ -17,7 +19,7 @@
       --bg: #14161a; --panel: #1e2127; --border: #2c303a; --text: #eceef1; --text-dim: #9aa1ac;
       --accent: #5b8def; --accent-dim: #223458; --danger: #f87171;
       --load-color: #4ade80; --unload-color: #f87171;
-      --map-water: #182233; --route-line: #4a5568;
+      --route-line: #cbd5e1;
       --shadow: 0 1px 3px rgba(0,0,0,0.4);
     }
   }
@@ -43,12 +45,15 @@
   .btn-danger { background: transparent; color: var(--danger); padding: 4px 8px; font-size: 0.8rem; }
   .btn-secondary { background: var(--accent-dim); color: var(--accent); font-size: 0.8rem; padding: 7px 10px; }
   .toolbar { display: flex; gap: 8px; margin-top: 10px; flex-wrap: wrap; }
-  .map-wrap { overflow-x: auto; }
-  svg { width: 100%; height: auto; display: block; min-height: 200px; }
-  .dot-load { fill: var(--load-color); cursor: pointer; }
-  .dot-unload { fill: var(--unload-color); cursor: pointer; }
-  .route-line { stroke: var(--route-line); stroke-width: 1.8; opacity: 0.75; cursor: pointer; }
-  .route-line:hover, .dot-load:hover, .dot-unload:hover { opacity: 1; }
+  #map-container { height: 480px; width: 100%; border-radius: 10px; z-index: 0; }
+  .dot-icon { width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; box-shadow: 0 0 3px rgba(0,0,0,0.5); }
+  .dot-load-icon { background: var(--load-color); }
+  .dot-unload-icon { background: var(--unload-color); }
+  .arrow-icon { display: flex; align-items: center; justify-content: center; }
+  .leaflet-tooltip.date-label { background: var(--panel); color: var(--text); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; font-size: 11px; font-weight: 700; box-shadow: 0 1px 3px rgba(0,0,0,0.25); }
+  .leaflet-tooltip.date-label-load { color: var(--load-color); border-color: var(--load-color); }
+  .leaflet-tooltip.date-label-unload { color: var(--unload-color); border-color: var(--unload-color); }
+  .leaflet-tooltip-top.date-label::before { display: none; }
   .legend { display: flex; gap: 16px; font-size: 0.78rem; color: var(--text-dim); margin-top: 8px; }
   .legend span { display: inline-flex; align-items: center; gap: 5px; }
   .legend i { width: 9px; height: 9px; border-radius: 50%; display: inline-block; }
@@ -121,14 +126,15 @@
   </div>
 
   <div>
-    <div class="panel map-wrap">
+    <div class="panel">
       <h2>Mapa tras</h2>
       <div id="map-container"></div>
       <div class="legend">
         <span><i style="background:var(--load-color)"></i>Załadunek</span>
         <span><i style="background:var(--unload-color)"></i>Rozładunek</span>
+        <span>➤ kierunek jazdy</span>
       </div>
-      <div class="hint">Kliknij punkt lub trasę, aby przejść do wpisu na liście. Dla PL/DE/CZ/NL/BE/IT pozycja jest liczona z regionu kodu pocztowego; dla pozostałych krajów pokazywane jest przybliżone centrum kraju.</div>
+      <div class="hint">Mapa OpenStreetMap — możesz przybliżać i przesuwać. Nad zieloną kropką widoczna jest data załadunku, nad czerwoną data rozładunku. Kliknij punkt lub trasę, aby przejść do wpisu na liście. Dla PL/DE/CZ/NL/BE/IT pozycja jest liczona z regionu kodu pocztowego; dla pozostałych krajów pokazywane jest przybliżone centrum kraju.</div>
     </div>
 
     <div class="panel table-wrap" style="margin-top:20px;">
@@ -244,59 +250,72 @@ function fmtDate(d) {
   return p.length === 3 ? `${p[2]}.${p[1]}.${p[0]}` : d;
 }
 
-function projectPoint(lat, lon, width, height, pad) {
-  const lonMin=-12, lonMax=40, latMin=34, latMax=66;
-  const x = pad + (lon - lonMin) / (lonMax - lonMin) * (width - 2*pad);
-  const y = pad + (latMax - lat) / (latMax - latMin) * (height - 2*pad);
-  return [x, y];
+function getCssVar(name) {
+  return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 }
 
-function shortenEnd(x1, y1, x2, y2, by) {
-  const dx = x2 - x1, dy = y2 - y1;
-  const len = Math.sqrt(dx*dx + dy*dy) || 1;
-  return [x2 - (dx/len)*by, y2 - (dy/len)*by];
+function bearingDeg(lat1, lon1, lat2, lon2) {
+  const toRad = d => d * Math.PI / 180;
+  const φ1 = toRad(lat1), φ2 = toRad(lat2);
+  const Δλ = toRad(lon2 - lon1);
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x = Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+  return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
+}
+
+let leafletMap = null;
+let mapLayer = null;
+
+function initLeafletMap() {
+  leafletMap = L.map('map-container', { scrollWheelZoom: true }).setView([50.0, 15.0], 4);
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+    maxZoom: 18,
+    attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+  }).addTo(leafletMap);
+  mapLayer = L.layerGroup().addTo(leafletMap);
 }
 
 function renderMap() {
-  try {
-    const width = 760, height = 480, pad = 20;
-    let svg = `<svg viewBox="0 0 ${width} ${height}" xmlns="http://www.w3.org/2000/svg">`;
-    svg += `<defs>
-      <marker id="arrowhead" markerWidth="8" markerHeight="8" refX="5.5" refY="3" orient="auto" markerUnits="userSpaceOnUse">
-        <path d="M0,0 L7,3 L0,6 Z" fill="var(--route-line)"/>
-      </marker>
-    </defs>`;
-    svg += `<rect x="0" y="0" width="${width}" height="${height}" fill="var(--map-water)" rx="10"/>`;
+  if (!mapLayer) return;
+  mapLayer.clearLayers();
 
-    const pts = shipments.map(s => ({
-      s,
-      loadC: estimateCoords(s.krajZ, s.kodZ),
-      unloadC: estimateCoords(s.krajR, s.kodR)
-    }));
+  shipments.forEach(s => {
+    const loadC = estimateCoords(s.krajZ, s.kodZ);
+    const unloadC = estimateCoords(s.krajR, s.kodR);
+    if (!loadC || !unloadC) return;
 
-    pts.forEach(({s, loadC, unloadC}) => {
-      if (!loadC || !unloadC) return;
-      const [x1,y1] = projectPoint(loadC[0], loadC[1], width, height, pad);
-      const [x2raw,y2raw] = projectPoint(unloadC[0], unloadC[1], width, height, pad);
-      const [x2,y2] = shortenEnd(x1, y1, x2raw, y2raw, 9);
-      svg += `<line class="route-line" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" marker-end="url(#arrowhead)" onclick="focusRow('${s.id}')"/>`;
+    const routeColor = getCssVar('--route-line') || '#475569';
+
+    const line = L.polyline([loadC, unloadC], { color: routeColor, weight: 2.5, opacity: 0.85 });
+    line.on('click', () => focusRow(s.id));
+    line.addTo(mapLayer);
+
+    const midLat = (loadC[0] + unloadC[0]) / 2;
+    const midLon = (loadC[1] + unloadC[1]) / 2;
+    const angle = bearingDeg(loadC[0], loadC[1], unloadC[0], unloadC[1]);
+    const arrowIcon = L.divIcon({
+      className: 'arrow-icon',
+      html: `<div style="transform: rotate(${angle - 90}deg); font-size:18px; line-height:1; color:${routeColor};">➤</div>`,
+      iconSize: [20, 20],
+      iconAnchor: [10, 10]
     });
-    pts.forEach(({s, loadC, unloadC}) => {
-      if (loadC) {
-        const [x,y] = projectPoint(loadC[0], loadC[1], width, height, pad);
-        svg += `<circle class="dot-load" cx="${x}" cy="${y}" r="5" onclick="focusRow('${s.id}')"><title>Załadunek: ${escapeHtml(s.kodZ)} ${escapeHtml(s.krajZ)}</title></circle>`;
-      }
-      if (unloadC) {
-        const [x,y] = projectPoint(unloadC[0], unloadC[1], width, height, pad);
-        svg += `<circle class="dot-unload" cx="${x}" cy="${y}" r="5" onclick="focusRow('${s.id}')"><title>Rozładunek: ${escapeHtml(s.kodR)} ${escapeHtml(s.krajR)}</title></circle>`;
-      }
-    });
-    svg += `</svg>`;
-    document.getElementById('map-container').innerHTML = svg;
-  } catch (e) {
-    document.getElementById('map-container').innerHTML = '';
-    setStatus('Błąd rysowania mapy: ' + e.message, true);
-  }
+    L.marker([midLat, midLon], { icon: arrowIcon })
+      .on('click', () => focusRow(s.id))
+      .addTo(mapLayer);
+
+    const loadIcon = L.divIcon({ className: 'dot-icon dot-load-icon', html: '', iconSize: [14, 14], iconAnchor: [7, 7] });
+    const unloadIcon = L.divIcon({ className: 'dot-icon dot-unload-icon', html: '', iconSize: [14, 14], iconAnchor: [7, 7] });
+
+    L.marker(loadC, { icon: loadIcon })
+      .bindTooltip(fmtDate(s.dataOd) || '—', { permanent: true, direction: 'top', offset: [0, -6], className: 'date-label date-label-load' })
+      .on('click', () => focusRow(s.id))
+      .addTo(mapLayer);
+
+    L.marker(unloadC, { icon: unloadIcon })
+      .bindTooltip(fmtDate(s.dataDo) || '—', { permanent: true, direction: 'top', offset: [0, -6], className: 'date-label date-label-unload' })
+      .on('click', () => focusRow(s.id))
+      .addTo(mapLayer);
+  });
 }
 
 function focusRow(id) {
@@ -447,6 +466,7 @@ document.getElementById('file-import').addEventListener('change', (e) => {
   e.target.value = '';
 });
 
+initLeafletMap();
 renderMap();
 renderTable();
 refreshCarrierList();
